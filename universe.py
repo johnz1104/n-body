@@ -2,10 +2,14 @@
 Universe: N-body simulation engine.
 
 Force selection, RK4 and leapfrog integration, and conservation diagnostics.
+The array-based JAX integrator is below the Universe class.
 """
 
 import numpy as np
-from core import Body, MultipoleExpansion, ParticleMesh, _finite_scalar
+from typing import NamedTuple, Any
+from core import (Body, MultipoleExpansion, ParticleMesh, _finite_scalar,
+                  _jax_modules, _concrete_array, make_state,
+                  differentiable_accelerations)
 
 
 class Universe:
@@ -75,6 +79,25 @@ class Universe:
         if any(existing is body for existing in self.bodies):
             raise ValueError("The same Body cannot be added twice")
         self.bodies.append(body)
+
+    def differentiable_state(self):
+        """Snapshot current Body values into an independent JAX ParticleState."""
+        return make_state([b.mass for b in self.bodies],
+                          [b.position for b in self.bodies],
+                          [b.velocity for b in self.bodies])
+
+    def simulate_differentiable(self, steps, method="leapfrog", *, state=None):
+        """Simulate direct gravity without changing the Universe or its histories.
+
+        Pass state when differentiating masses or initial conditions. Keep
+        driver settings fixed when using this method inside jax.jit.
+        """
+        if self.force_method != "direct":
+            raise ValueError("Differentiable simulation currently requires force_method='direct'")
+        if state is None:
+            state = self.differentiable_state()
+        return simulate(state, dt=self.dt, steps=steps, method=method, G=self.G,
+                        epsilon=self.epsilon, t0=self.time)
 
     # force computation
     def _compute_accelerations_direct(self):
@@ -228,3 +251,77 @@ class Universe:
                 print(f"  [{pct:5.1f}%]  t = {self.time:.6e}")
         if steps and self.record_every and self.diag_time[-1] != self.time:
             self._record()
+
+
+# Differentiable integration
+
+class Trajectory(NamedTuple):
+    """JAX arrays: times (steps+1,), positions/velocities (steps+1, N, 3)."""
+
+    times: Any
+    positions: Any
+    velocities: Any
+
+
+def simulate(state, *, dt, steps, method="leapfrog", G=1.0, epsilon=0.0, t0=0.0):
+    """Integrate JAX particle arrays with direct gravity, RK4 or leapfrog.
+
+    Returns the initial state and every following step. Keyword arguments are
+    fixed settings; derivatives are taken with respect to the input state.
+    """
+    if method not in Universe.INTEGRATORS:
+        raise ValueError(f"Unknown integrator {method!r}")
+    if (isinstance(steps, (bool, np.bool_))
+            or not isinstance(steps, (int, np.integer))
+            or steps < 0):
+        raise ValueError("steps must be a non-negative integer")
+    dt = _finite_scalar(dt, "dt", positive=True)
+    G = _finite_scalar(G, "G", positive=True)
+    epsilon = _finite_scalar(epsilon, "epsilon")
+    t0 = float(t0)
+    if not np.isfinite(t0) or not np.isfinite(t0 + steps * dt):
+        raise ValueError("trajectory times must be finite")
+    jax, jnp = _jax_modules()
+    state = make_state(*state)
+    positions = _concrete_array(state.positions)
+    if epsilon == 0 and positions is not None:
+        if len(np.unique(positions, axis=0)) != len(positions):
+            raise ValueError("Coincident particles require epsilon > 0")
+
+    def acceleration(r):
+        return differentiable_accelerations(state.masses, r, G, epsilon)
+
+    def step(carry, unused):
+        r, v = carry
+        if method == "leapfrog":
+            # kick (half), drift (full), kick (half)
+            half_v = v + 0.5 * dt * acceleration(r)
+            r_next = r + dt * half_v
+            v_next = half_v + 0.5 * dt * acceleration(r_next)
+        else:
+            # k1
+            k1r = v
+            k1v = acceleration(r)
+
+            # k2, k3: midpoint estimates
+            k2r = v + 0.5 * dt * k1v
+            k2v = acceleration(r + 0.5 * dt * k1r)
+            k3r = v + 0.5 * dt * k2v
+            k3v = acceleration(r + 0.5 * dt * k2r)
+
+            # k4: full step
+            k4r = v + dt * k3v
+            k4v = acceleration(r + dt * k3r)
+
+            # weighted combination
+            r_next = r + dt / 6 * (k1r + 2*k2r + 2*k3r + k4r)
+            v_next = v + dt / 6 * (k1v + 2*k2v + 2*k3v + k4v)
+        return (r_next, v_next), (r_next, v_next)
+
+    # scan keeps the time loop compact when JAX compiles it.
+    initial = (state.positions, state.velocities)
+    _, (r, v) = jax.lax.scan(step, initial, None, length=int(steps))
+    times = t0 + dt * jnp.arange(steps + 1, dtype=jnp.float64)
+    positions = jnp.concatenate((state.positions[None], r))
+    velocities = jnp.concatenate((state.velocities[None], v))
+    return Trajectory(times, positions, velocities)

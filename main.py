@@ -1,7 +1,7 @@
 """
 N-body examples and command-line entry point.
 
-Solar system, figure-eight choreography, and random cluster.
+Solar system, figure-eight choreography, random cluster, and radial-velocity fit.
 """
 
 import numpy as np
@@ -148,6 +148,135 @@ def compare_force_methods(save_path=None):
     return runs
 
 
+#  SCENARIO 4 — Radial-velocity fit
+
+# AU, Julian years, solar masses
+RV_G = 4 * np.pi**2
+AU_PER_YEAR_TO_M_PER_S = 149597870700.0 / (365.25 * 86400.0)
+
+
+def planetary_state(parameters):
+    """Star and two planets, with adjustable inner-planet mass and phase.
+
+    Mass is in solar masses and phase in radians. Initial speeds approximate
+    circular two-body orbits; the simulation includes all mutual interactions.
+    """
+    from core import _jax_modules, make_state, barycentric_state
+    _, jnp = _jax_modules()
+    masses = jnp.array([1.0, parameters["planet_mass"], 0.0005])
+    phases = jnp.array([parameters["phase"], 2.2])
+    radii = jnp.array([0.5, 1.1])
+    c = jnp.cos(phases)
+    s = jnp.sin(phases)
+    zero = jnp.zeros(2)
+    planet_positions = radii[:, None] * jnp.stack((c, s, zero), axis=1)
+    speeds = jnp.sqrt(RV_G * (masses[0] + masses[1:]) / radii)
+    planet_velocities = speeds[:, None] * jnp.stack((-s, c, zero), axis=1)
+
+    # Add the star, then shift to the center-of-mass frame.
+    positions = jnp.concatenate((jnp.zeros((1, 3)), planet_positions))
+    velocities = jnp.concatenate((jnp.zeros((1, 3)), planet_velocities))
+    state = make_state(masses, positions, velocities)
+    return barycentric_state(state)
+
+
+def radial_velocity_demo(method="leapfrog", steps=1000, *, plot=True,
+                         output_dir="results/inference", seed=42):
+    """Fit a planet's mass and phase from synthetic stellar radial velocities.
+
+    Generate observations at half the fitting timestep, with 0.3 m/s noise.
+    Write the fit summary, data and optional plot to output_dir.
+    """
+    import json
+    from pathlib import Path
+    from core import enable_autodiff, _jax_modules
+    from universe import simulate
+    from observables import radial_velocity, sample_observable
+    from inference import fit_parameters
+
+    if (isinstance(steps, (bool, np.bool_))
+            or not isinstance(steps, (int, np.integer))
+            or steps < 100):
+        raise ValueError("RV demo needs at least 100 steps over its two-year baseline")
+    enable_autodiff()
+    jax, _ = _jax_modules()
+    dt = 2.0 / steps
+    rng = np.random.default_rng(seed)
+    times = np.sort(rng.uniform(0.0, 2.0, 96))
+    truth = {"planet_mass": 0.001, "phase": 0.7}
+    initial = {"planet_mass": 0.0006, "phase": 1.1}
+
+    def model(parameters, refinement=1):
+        state = planetary_state(parameters)
+        trajectory = simulate(state, dt=dt/refinement,
+                              steps=steps*refinement, method=method, G=RV_G, epsilon=0.0)
+        rv = radial_velocity(trajectory, line_of_sight=(1, 0, 0)) * AU_PER_YEAR_TO_M_PER_S
+        return trajectory, rv
+
+    def predict(parameters):
+        trajectory, rv = model(parameters)
+        return sample_observable(trajectory, rv, times)
+
+    # synthetic observations at a finer timestep
+    truth_trajectory, truth_curve = model(truth, refinement=2)
+    noiseless = np.asarray(sample_observable(truth_trajectory, truth_curve, times))
+    sigma = np.full(times.shape, 0.3)  # m/s, independent Gaussian noise
+    observations = noiseless + rng.normal(size=times.size) * sigma
+
+    # fit the inner planet, keeping geometry and other parameters fixed
+    bounds = {"planet_mass": (0.0001, 0.003), "phase": (-np.pi, np.pi)}
+    fit = fit_parameters(predict, initial, observations, sigma,
+                         bounds=bounds)
+    fitted_trajectory, fitted_curve = model(fit.parameters)
+    _, initial_curve = model(initial)
+    sensitivity = jax.jacrev(predict)(fit.parameters)
+
+    # save numerical results
+    summary = {
+        "integrator": method,
+        "steps": steps,
+        "dt_years": dt,
+        "truth_dt_years": dt/2,
+        "seed": seed,
+        "observations": times.size,
+        "noise_m_per_s": 0.3,
+        "true_parameters": truth,
+        "initial_parameters": initial,
+        "fitted_parameters": fit.parameters,
+        "success": fit.success,
+        "message": fit.message,
+        "nfev": fit.nfev,
+        "initial_chi_squared": 2*fit.initial_cost,
+        "chi_squared": fit.chi_squared,
+        "degrees_of_freedom": times.size - len(initial),
+        "units": {"planet_mass": "solar masses", "phase": "radians"},
+    }
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "fit.json").write_text(json.dumps(summary, indent=2) + "\n")
+    np.savez(directory / "observations.npz", times=times, observations=observations,
+             uncertainties=sigma, fitted=fit.prediction, noiseless=noiseless,
+             model_times=np.asarray(fitted_trajectory.times),
+             model_rv=np.asarray(fitted_curve), cost_history=fit.cost_history,
+             d_rv_d_mass=np.asarray(sensitivity["planet_mass"]),
+             d_rv_d_phase=np.asarray(sensitivity["phase"]))
+    if plot:
+        from visualization import plot_radial_velocity_fit
+
+        plot_sensitivity = {
+            "Mass (fractional change)":
+                np.asarray(sensitivity["planet_mass"]) * fit.parameters["planet_mass"],
+            "Phase (per radian)": np.asarray(sensitivity["phase"]),
+        }
+        plot_radial_velocity_fit(times, observations, sigma,
+                                 np.asarray(fitted_trajectory.times),
+                                 np.asarray(initial_curve), np.asarray(fitted_curve),
+                                 fit.prediction, fit.cost_history, plot_sensitivity,
+                                 save_path=directory / "fit.png")
+    print(json.dumps(summary, indent=2))
+    return fit
+
+
 # Command-line options
 
 def main(argv=None):
@@ -155,7 +284,7 @@ def main(argv=None):
     from pathlib import Path
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scenario", default="cluster",
-                        choices=("solar", "figure-eight", "cluster"))
+                        choices=("solar", "figure-eight", "cluster", "rv-fit"))
     parser.add_argument("--integrator", choices=Universe.INTEGRATORS, default="leapfrog")
     parser.add_argument("--force", choices=Universe.FORCE_METHODS, default="direct")
     parser.add_argument("--steps", type=int, help="step count; scenario default if omitted")
@@ -166,8 +295,27 @@ def main(argv=None):
     parser.add_argument("--box-size", type=float, help="periodic box side in scenario position units")
     parser.add_argument("--record-every", type=int, default=1, help="0 disables histories and diagnostics")
     parser.add_argument("--output", help="figure path (default: results/<scenario>_<integrator>_<force>.png)")
-    parser.add_argument("--no-plot", action="store_true", help="run using only NumPy")
+    parser.add_argument("--output-dir", default="results/inference", help="RV fit data and figure directory")
+    parser.add_argument("--seed", type=int, default=42, help="RV observation/noise seed")
+    parser.add_argument("--no-plot", action="store_true", help="disable plotting (rv-fit still needs JAX/SciPy)")
     args = parser.parse_args(argv)
+
+    # inference example
+    if args.scenario == "rv-fit":
+        if args.force != "direct":
+            parser.error("rv-fit requires --force direct")
+        if args.output:
+            parser.error("rv-fit uses --output-dir for its figure and numerical data")
+        try:
+            result = radial_velocity_demo(method=args.integrator,
+                                           steps=1000 if args.steps is None else args.steps,
+                                           plot=not args.no_plot,
+                                           output_dir=args.output_dir, seed=args.seed)
+        except (ValueError, ImportError) as exc:
+            parser.error(str(exc))
+        if not result.success:
+            parser.exit(1, "Fit did not converge; inspect fit.json for optimizer diagnostics.\n")
+        return result
 
     # forward simulation examples
     if args.record_every == 0 and not args.no_plot:

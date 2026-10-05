@@ -1,10 +1,11 @@
 """
 Core data structures and gravity calculations for the N-body solver.
 
-Body, octree, multipole and particle-mesh forces.
+Body, octree, multipole and particle-mesh forces, plus JAX array operations.
 """
 
 import itertools
+from typing import NamedTuple, Any
 import numpy as np
 
 
@@ -315,3 +316,111 @@ class ParticleMesh:
             return 0.0
         rho, phi, _ = self._solve(bodies, G)
         return float(0.5 * np.sum(rho * phi) * (self.box_size / self.grid_size)**3)
+
+
+# Differentiable particle state and gravity
+
+def enable_autodiff():
+    """Enable JAX float64 before creating simulation arrays.
+
+    Changes JAX's process-wide setting. The NumPy solver does not need JAX.
+    """
+    try:
+        import jax
+    except ImportError as exc:
+        raise ImportError("Install differentiable support with: "
+                          "python -m pip install -r requirements-diff.txt") from exc
+    jax.config.update("jax_enable_x64", True)
+
+
+def _jax_modules():
+    try:
+        import jax
+        import jax.numpy as jnp
+    except ImportError as exc:
+        raise ImportError("Install differentiable support with: "
+                          "python -m pip install -r requirements-diff.txt") from exc
+    if not jax.config.x64_enabled:
+        raise RuntimeError("Call core.enable_autodiff() before creating JAX arrays; "
+                           "the differentiable solver requires float64.")
+    return jax, jnp
+
+
+def _concrete_array(value):
+    """Get values for validation when JAX is not tracing the calculation."""
+    jax, _ = _jax_modules()
+    if isinstance(value, jax.core.Tracer):
+        return None
+    return np.asarray(value)
+
+
+class ParticleState(NamedTuple):
+    """Immutable JAX pytree: masses (N,), positions/velocities (N, 3)."""
+
+    masses: Any
+    positions: Any
+    velocities: Any
+
+
+def make_state(masses, positions, velocities):
+    """Create a particle state from float64 arrays.
+
+    Checks values outside grad/jit and shapes inside it. When fitting, use
+    bounds to keep traced masses positive and other parameters finite.
+    """
+    _, jnp = _jax_modules()
+    masses = jnp.asarray(masses, dtype=jnp.float64)
+    positions = jnp.asarray(positions, dtype=jnp.float64)
+    velocities = jnp.asarray(velocities, dtype=jnp.float64)
+    state = ParticleState(masses, positions, velocities)
+    if state.masses.ndim != 1 or state.masses.size == 0:
+        raise ValueError("masses must have shape (N,) with N >= 1")
+    shape = (state.masses.size, 3)
+    if state.positions.shape != shape or state.velocities.shape != shape:
+        raise ValueError("positions and velocities must have shape (N, 3)")
+    for name, array in zip(state._fields, state):
+        concrete = _concrete_array(array)
+        if concrete is not None and not np.isfinite(concrete).all():
+            raise ValueError(f"{name} must be finite")
+    masses = _concrete_array(state.masses)
+    if masses is not None and np.any(masses <= 0):
+        raise ValueError("masses must be positive")
+    return state
+
+
+def barycentric_state(state):
+    """Translate a state to its center-of-mass position and velocity frame."""
+    _, jnp = _jax_modules()
+    state = make_state(*state)
+    weights = state.masses[:, None] / jnp.sum(state.masses)
+    com = jnp.sum(weights * state.positions, axis=0)
+    com_velocity = jnp.sum(weights * state.velocities, axis=0)
+    return ParticleState(state.masses, state.positions - com,
+                         state.velocities - com_velocity)
+
+
+def differentiable_accelerations(masses, positions, G=1.0, epsilon=0.0):
+    """O(N²) pairwise Plummer acceleration using JAX arrays.
+
+    G and epsilon are fixed. With epsilon=0, exact collisions are singular.
+    """
+    _, jnp = _jax_modules()
+    delta = positions[None, :, :] - positions[:, None, :]
+    diagonal = jnp.eye(positions.shape[0], dtype=bool)
+    # Remove self terms before division, otherwise their gradients become NaN.
+    d2 = jnp.where(diagonal, 1.0, jnp.sum(delta * delta, axis=-1) + epsilon**2)
+    kernel = jnp.where(diagonal, 0.0, d2**-1.5)
+    return G * jnp.sum(delta * (kernel * masses[None, :])[..., None], axis=1)
+
+
+def differentiable_energy(state, G=1.0, epsilon=0.0):
+    """Total isolated Plummer energy of one state; usable with grad and vmap."""
+    _, jnp = _jax_modules()
+    masses, positions, velocities = state
+    delta = positions[None, :, :] - positions[:, None, :]
+    pairs = jnp.triu(jnp.ones((masses.size, masses.size), dtype=bool), k=1)
+    d2 = jnp.where(pairs, jnp.sum(delta * delta, axis=-1) + epsilon**2, 1.0)
+    pair_energy = masses[:, None] * masses[None, :] / jnp.sqrt(d2)
+    pe = -G * jnp.sum(jnp.where(pairs, pair_energy, 0.0))
+    ke = 0.5 * jnp.sum(masses[:, None] * velocities**2)
+    return ke + pe

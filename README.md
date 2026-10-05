@@ -1,18 +1,22 @@
 # nbody
 
-A NumPy gravity lab with independent choices for **time integration** (RK4 or
-leapfrog) and **force evaluation** (direct, Barnes–Hut, multipole expansions,
-or periodic particle-mesh).
+A gravitational N-body toolkit with **differentiable simulations and parameter
+fitting**. It explores RK4 and leapfrog integration, direct and multipole tree
+forces, and periodic particle-mesh gravity. Its JAX path computes derivatives
+through direct-gravity simulations to fit masses and initial conditions to
+astronomical observations.
 
 `core.py` owns particles and gravity primitives. `universe.py` drives the
 simulation, integration, and diagnostics. `visualization.py` consumes recorded
-results without running the physics.
+results without running the physics. Differentiable RK4 and leapfrog currently
+support **direct gravity only**; tree and particle-mesh methods remain NumPy
+forward solvers.
 
 ## Quick start
 
-Python 3.10+ (tested with Python 3.12). Only NumPy is required for headless
-simulations. Matplotlib produces plots, Pillow produces GIFs, and pytest
-runs the numerical regression tests.
+Python 3.10+ (tested with Python 3.12). Only NumPy is required for headless forward
+simulations. Matplotlib produces plots and Pillow produces GIFs. JAX and SciPy
+are optional dependencies for differentiable simulation and fitting.
 
 ```bash
 python -m venv .venv
@@ -29,6 +33,31 @@ python main.py --scenario cluster --force particle-mesh --integrator rk4 \
 # Direct reference with no plotting dependency
 python main.py --scenario solar --force direct --integrator rk4 --steps 100 --no-plot
 ```
+
+To install the differentiable extension and run its example:
+
+```bash
+python -m pip install -r requirements-diff.txt
+python main.py --scenario rv-fit --integrator leapfrog
+# Also supports --integrator rk4 and --no-plot
+# Save a separate run without replacing a previous example:
+python main.py --scenario rv-fit --integrator rk4 --output-dir /tmp/nbody-rv-rk4
+```
+
+The demo generates 96 noisy stellar radial-velocity measurements for a star and
+two planets, then fits the inner planet's mass and initial orbital phase.
+Observations are generated at twice the fit's integration resolution, with a
+fixed random seed. Star mass, viewing geometry, other orbital parameters, and
+the outer planet are fixed. Units are AU, Julian years, and solar masses, with
+radial velocities converted to m/s.
+
+Outputs in `results/inference/` (ignored by Git):
+
+- `fit.json`: true/initial/fitted parameters, settings, optimizer status, and χ².
+- `observations.npz`: observations, uncertainties, fitted signal, sensitivities,
+  and optimization trial costs.
+- `fit.png`: signal, residuals, sensitivity curves, and optimization progress
+  (unless `--no-plot`).
 
 Plots default to `results/<scenario>_<integrator>_<force>.png`. Use `--output`
 to choose a path. Run `python main.py --help` for all options.
@@ -55,6 +84,138 @@ u = Universe(dt=0.01, G=1.0, force_method="particle-mesh",
              grid_size=32, box_size=8.0, box_origin=[-4, -4, -4])
 # Add bodies, then call u.run(..., method="rk4" or "leapfrog").
 ```
+
+## Differentiable simulation
+
+Call `enable_autodiff()` **before creating JAX arrays**. This explicitly enables
+JAX's process-wide float64 setting; the differentiable API rejects float32 mode.
+Plain imports of `core`, `universe`, `observables`, and `inference` do not load
+JAX, SciPy, or plotting libraries.
+
+```python
+from core import enable_autodiff, make_state
+enable_autodiff()
+
+import jax
+from universe import simulate
+from observables import radial_velocity
+
+state = make_state(
+    masses=[0.5, 0.5],
+    positions=[[-0.5, 0, 0], [0.5, 0, 0]],
+    velocities=[[0, -0.5, 0], [0, 0.5, 0]],
+)
+
+trajectory = simulate(state, dt=0.01, steps=200, method="leapfrog", G=1.0)
+# times: (201,), positions and velocities: (201, 2, 3), including initial state
+
+def final_velocity(s):
+    track = simulate(s, dt=0.01, steps=200, method="leapfrog", G=1.0)
+    return radial_velocity(track, body_index=0, line_of_sight=(1, 0, 0))[-1]
+
+gradient = jax.jit(jax.grad(final_velocity))(state)
+# gradient.masses: (2,), gradient.positions/velocities: (2, 3)
+```
+
+`ParticleState` and `Trajectory` are immutable named tuples of JAX arrays and
+work with `grad`, `jacrev`, `jit`, and `vmap`. `make_state` validates shapes,
+finite values, and positive masses for concrete inputs; when tracing under
+`jit`/`grad`, values cannot be checked in Python. Constrain optimized parameters
+to valid values with bounds or transformations such as log mass.
+
+For an existing direct-gravity `Universe`, use:
+
+```python
+state = u.differentiable_state()
+trajectory = u.simulate_differentiable(200, method="rk4", state=state)
+```
+
+Here `u` must have `force_method="direct"` and at least one body; the tree and
+periodic examples above intentionally do not support this operation.
+
+This snapshots the universe's current state and uses its `dt`, `G`, `epsilon`,
+and current time. It does **not** advance `u`, change its bodies, or append
+histories. Pass `state` explicitly to differentiate its inputs. Pure
+`universe.simulate()` is the main array API; its configuration keywords are
+static. When compiling a closure over a Universe, keep its configuration fixed
+or recreate the compiled function after changes.
+
+`core.barycentric_state` centers initial positions and velocities on the center
+of mass while preserving gradients. `core.differentiable_energy` computes the
+same isolated Plummer energy as the NumPy driver.
+
+## Observations and fitting
+
+`observables.py` provides:
+
+- `radial_velocity`: projected velocity, positive away from the observer; the
+  normalized line of sight points from observer to system. An additive systemic
+  velocity can itself be a fit parameter.
+- `sky_plane_positions`: two coordinates in an orthonormal sky basis, optionally
+  relative to another body. A supplied distance converts length offsets into
+  small-angle offsets in radians. Observer geometry is fixed.
+- `sample_observable`: linear interpolation at observation times. Eager calls
+  reject out-of-range times; compiled calls return NaNs outside the simulation
+  interval, which fitting rejects. Interpolation error must be checked along
+  with timestep error.
+
+The fitting interface accepts any pure JAX-compatible prediction function and
+an explicit dictionary of scalar parameters to vary. For example:
+
+```python
+import jax.numpy as jnp
+from inference import fit_parameters
+from observables import radial_velocity, sample_observable
+from main import planetary_state, RV_G, AU_PER_YEAR_TO_M_PER_S
+
+times = jnp.linspace(0, 2, 80)
+
+def predict(parameters):
+    track = simulate(planetary_state(parameters), dt=0.002, steps=1000,
+                     method="rk4", G=RV_G)
+    rv = radial_velocity(track, line_of_sight=(1, 0, 0)) * AU_PER_YEAR_TO_M_PER_S
+    return sample_observable(track, rv, times)
+
+# Replace this noiseless illustration with observed velocities in m/s.
+observed = predict({"planet_mass": 0.001, "phase": 0.7})
+fit = fit_parameters(
+    predict, {"planet_mass": 0.0006, "phase": 1.1}, observed,
+    uncertainties=0.3,
+    bounds={"planet_mass": (0.0001, 0.003), "phase": (-jnp.pi, jnp.pi)},
+)
+print(fit.success, fit.parameters, fit.chi_squared)
+```
+
+The optimizer uses SciPy bounded least squares with a JAX Jacobian. Its objective
+is `0.5 * sum(((prediction - observation) / uncertainty)**2)`, assuming independent
+Gaussian measurement errors. Predictions must match the observation shape;
+uncertainties may be a positive scalar or a broadcastable array. Fixed quantities
+stay inside the prediction function; positions and velocities can be fitted by
+mapping named scalar parameters into the initial state in that function.
+
+`FitResult` includes parameter values, predictions, normalized residuals, the
+weighted residual Jacobian, cost, trial cost history, optimizer status, and
+evaluation count. `success` reports optimizer convergence, not a unique or
+correct physical solution. Posterior sampling and uncertainty estimates are
+outside this first release. Initial guesses, parameter degeneracies, and
+correlated noise require additional analysis for real observations.
+
+### Numerical scope
+
+- Differentiation follows the **discrete numerical simulation**. Validate both
+  trajectories and derivatives under timestep refinement.
+- This is a fixed-particle, fixed-step Newtonian point-mass model with optional
+  Plummer softening. Exact unsoftened collisions are singular; mergers and
+  event-time derivatives are unsupported.
+- Full trajectories and reverse-mode intermediates consume memory. Direct
+  forces use O(N²) work/storage per force evaluation; this initial release is
+  intended for small systems, not large cosmological simulations.
+- Long chaotic trajectories can have very large, difficult-to-use derivatives.
+- The current tree decisions and PM grid operations are **not** differentiated.
+  Those backends explicitly reject `simulate_differentiable` rather than silently
+  returning incomplete gradients.
+- RV and sky projections omit light-travel time, relativity, stellar activity,
+  transit light curves, and instrument effects.
 
 ## Methods
 
@@ -167,6 +328,15 @@ integrator/backend combinations, coincident particles, PM mass conservation,
 self-force, periodic crossings, and analytical Fourier modes through the full
 particle-to-grid-to-particle pipeline.
 
+Differentiable tests additionally cover agreement with the independent NumPy
+solver, mass/position/velocity gradients against finite differences, derivative
+convergence toward an analytic circular binary, energy-gradient consistency,
+momentum and energy behavior, single-particle self derivatives, JIT/batching,
+observation geometry and interpolation, bounded weighted fitting, and parameter
+recovery from noisy observations generated at finer resolution. With JAX absent,
+the differentiable test module skips; `requirements-dev.txt` installs it so the
+full suite runs.
+
 The existing images and GIF under `results/` are **historical showcase assets**
 from the earlier implementation. Their embedded numbers are not current
 validation evidence. `generate_results.py` now computes validation table entries
@@ -177,13 +347,16 @@ for compatibility but the solver is the quadrupole tree described above.
 ## Project layout
 
 ```text
-core.py                 Body, octree, multipole and particle-mesh forces
-universe.py             Force dispatch, RK4/leapfrog and diagnostics
-visualization.py        Trajectories, diagnostic plots, tables, animations
-main.py                 Forward scenarios and CLI
+core.py                 Particle states, NumPy/JAX forces, tree and mesh solvers
+universe.py             Simulation drivers, NumPy/JAX RK4/leapfrog, diagnostics
+observables.py          Radial velocities, sky projection, observation sampling
+inference.py            Bounded fitting with autodiff Jacobians
+visualization.py        Trajectories, inference plots, tables, animations
+main.py                 Forward scenarios, RV inference demo, CLI
 generate_results.py     Showcase simulation recipes
 stub.py                 Compatibility imports and attach(), no solver duplication
 tests/test_solver.py    Numerical and API regressions
+tests/test_differentiable.py  Derivative and inference regressions
 requirements*.txt       Runtime and development dependencies
 results/                Historical gallery
 ```
@@ -192,3 +365,11 @@ Existing `from stub import FastMultipole, ParticleMesh, attach` usage still
 works for the built-in backends. `FastMultipole` is a legacy name for
 `MultipoleExpansion`; `attach` now configures native dispatch without replacing
 `Universe` methods. Prefer the constructor API for new work.
+
+## Possible extensions
+
+Differentiable particle-mesh and multipole backends, memory-efficient adjoints,
+more complete observation models, and posterior sampling are future work. This
+project makes no first-ever claim; related research software includes
+[NbodyGradient](https://ericagol.github.io/NbodyGradient.jl/dev/) and
+[JaxPM](https://github.com/DifferentiableUniverseInitiative/JaxPM).

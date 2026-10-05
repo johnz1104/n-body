@@ -374,3 +374,51 @@ def animate_trajectories(universe, save_path, *, stride=2, trail_length=300, fps
                               interval=1000/fps, blit=True)
     animation.save(save_path, writer=PillowWriter(fps=fps), dpi=100)
     plt.close(fig)
+
+
+# Radial-velocity fit
+
+def plot_radial_velocity_fit(times, observations, uncertainties, model_times,
+                             initial_curve, fitted_curve, fitted_observations,
+                             cost_history, sensitivities, *, save_path=None):
+    """Plot the RV signal, sensitivities, residuals and fitting progress."""
+    with plt.style.context("default"):
+        fig, axes = plt.subplots(2, 2, figsize=(12, 8), layout="constrained")
+        signal, sensitivity_ax, residual_ax, cost_ax = axes.ravel()
+
+        # observations and model curves
+        signal.errorbar(times, observations, yerr=uncertainties, fmt=".",
+                        color="#334155", alpha=0.7, label="Synthetic observations")
+        signal.plot(model_times, initial_curve, color="#94a3b8", ls="--", label="Initial guess")
+        signal.plot(model_times, fitted_curve, color="#2563eb", label="Fitted N-body model")
+        signal.set(title="Stellar radial velocity", xlabel="Time (years)", ylabel="Velocity (m/s)")
+        signal.legend(fontsize=8)
+
+        # response to each fitted parameter
+        for label, derivative in sensitivities.items():
+            sensitivity_ax.plot(times, derivative, label=label)
+        sensitivity_ax.set(title="Local sensitivity at fitted parameters", xlabel="Time (years)",
+                           ylabel="RV response (m/s per stated change)")
+        sensitivity_ax.legend(fontsize=8)
+
+        # residuals in units of the measurement uncertainty
+        residuals = (np.asarray(observations) - fitted_observations) / uncertainties
+        residual_ax.axhline(0, color="#94a3b8", lw=1)
+        residual_ax.plot(times, residuals, ".", color="#2563eb")
+        residual_ax.set(title="Observation − fitted model", xlabel="Time (years)",
+                        ylabel="Residual / measurement uncertainty")
+        # optimizer trial history
+        evaluations = np.arange(1, len(cost_history)+1)
+        cost_ax.semilogy(evaluations, np.maximum(cost_history, 1e-30),
+                        "o-", color="#0f766e", ms=4)
+        cost_ax.set(title="Optimization trial evaluations", xlabel="Model/Jacobian evaluation",
+                    ylabel="Weighted least-squares cost (χ² / 2)")
+        for ax in axes.ravel():
+            ax.grid(alpha=0.15)
+        fig.suptitle("Differentiable N-body inference · star and two planets", fontsize=15)
+        if save_path is None:
+            plt.show()
+        else:
+            fig.savefig(save_path, dpi=160)
+            plt.close(fig)
+    return fig
