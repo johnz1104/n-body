@@ -3,7 +3,7 @@ Visualization for N-body simulations.
 
 Produces a multi-panel figure:
   • 3D orbit plot (top-left)
-  • XY, XZ, YZ projections (top-right, bottom-left, bottom-right)
+  • XY and XZ projections (right)
   • Conservation diagnostics strip along the bottom
 """
 
@@ -43,7 +43,7 @@ def _equal_aspect(ax, xs, ys, margin=1.15):
     """Set equal aspect ratio centered on data."""
     xr = max(xs) - min(xs) if xs else 1
     yr = max(ys) - min(ys) if ys else 1
-    r = max(xr, yr) * margin * 0.5
+    r = max(xr, yr, 1e-12) * margin * 0.5
     cx = (max(xs) + min(xs)) / 2
     cy = (max(ys) + min(ys)) / 2
     ax.set_xlim(cx - r, cx + r)
@@ -51,7 +51,8 @@ def _equal_aspect(ax, xs, ys, margin=1.15):
     ax.set_aspect("equal")
 
 
-def plot_results(universe, title: str = "N-Body Simulation", save_path: str | None = None):
+def plot_results(universe, title: str = "N-Body Simulation", save_path: str | None = None,
+                 *, time_scale=1.0, time_unit="simulation units", length_unit="simulation units"):
     """
     Generate a comprehensive results figure.
 
@@ -59,6 +60,7 @@ def plot_results(universe, title: str = "N-Body Simulation", save_path: str | No
     universe : Universe   A universe that has already been run.
     title : str           Figure super-title.
     save_path : str       If given, save to this path instead of showing.
+    time_scale : float    Divide recorded times by this value (86400 for days).
     """
     bodies = universe.bodies
 
@@ -103,7 +105,7 @@ def plot_results(universe, title: str = "N-Body Simulation", save_path: str | No
     # equal-aspect 3D
     if all_x:
         ranges = [max(all_x)-min(all_x), max(all_y)-min(all_y), max(all_z)-min(all_z)]
-        half = max(ranges) * 0.6
+        half = max(*ranges, 1e-12) * 0.6
         cx = (max(all_x)+min(all_x))/2
         cy = (max(all_y)+min(all_y))/2
         cz = (max(all_z)+min(all_z))/2
@@ -111,9 +113,9 @@ def plot_results(universe, title: str = "N-Body Simulation", save_path: str | No
         ax3d.set_ylim(cy-half, cy+half)
         ax3d.set_zlim(cz-half, cz+half)
 
-    ax3d.set_xlabel("X (m)", fontsize=9)
-    ax3d.set_ylabel("Y (m)", fontsize=9)
-    ax3d.set_zlabel("Z (m)", fontsize=9)
+    ax3d.set_xlabel(f"X ({length_unit})", fontsize=9)
+    ax3d.set_ylabel(f"Y ({length_unit})", fontsize=9)
+    ax3d.set_zlabel(f"Z ({length_unit})", fontsize=9)
     ax3d.view_init(elev=25, azim=135)
     ax3d.legend(fontsize=7, loc="upper left", framealpha=0.5,
                 facecolor="#222", edgecolor="#555", labelcolor="white")
@@ -153,7 +155,7 @@ def plot_results(universe, title: str = "N-Body Simulation", save_path: str | No
     # conservation diagnostics
     t = np.array(universe.diag_time)
     if len(t) > 1:
-        t_days = t / 86400.0  # convert to days for readability
+        t_days = t / time_scale
 
         # energy panel
         ax_e = fig.add_subplot(gs[2, 0], **dark_ax_kw)
@@ -162,8 +164,9 @@ def plot_results(universe, title: str = "N-Body Simulation", save_path: str | No
         rel_err = (E - E[0]) / abs(E0)
         ax_e.plot(t_days, rel_err, color="#ff6b6b", lw=1)
         ax_e.set_ylabel("ΔE / |E₀|", color="#ccc", fontsize=9)
-        ax_e.set_xlabel("Time (days)", color="#aaa", fontsize=8)
-        ax_e.set_title("Relative Energy Error", color="#ccc", fontsize=10)
+        ax_e.set_xlabel(f"Time ({time_unit})", color="#aaa", fontsize=8)
+        ax_e.set_title("Mesh Energy Change" if universe.force_method == "particle-mesh"
+                       else "Relative Energy Error", color="#ccc", fontsize=10)
         ax_e.tick_params(colors="#888", labelsize=7)
         ax_e.spines[:].set_color("#333")
         ax_e.axhline(0, color="#555", lw=0.5, ls="--")
@@ -177,22 +180,23 @@ def plot_results(universe, title: str = "N-Body Simulation", save_path: str | No
         # angular momentum panel
         ax_l = fig.add_subplot(gs[2, 1], **dark_ax_kw)
         L = np.array(universe.diag_L)
-        L_mag = np.linalg.norm(L, axis=1)
-        L0 = L_mag[0]
+        L0 = np.linalg.norm(L[0])
+        L_change = np.linalg.norm(L - L[0], axis=1)
         if L0 > 1e-12:
-            rel_L = (L_mag - L0) / L0
+            rel_L = L_change / L0
             max_l_drift = np.max(np.abs(rel_L))
             drift_label = f"max |ΔL/L₀| = {max_l_drift:.2e}"
             ylabel = "ΔL / |L₀|"
         else:
-            rel_L = L_mag - L0
+            rel_L = L_change
             max_l_drift = np.max(np.abs(rel_L))
             drift_label = f"max |ΔL| = {max_l_drift:.2e}"
             ylabel = "ΔL (absolute)"
         ax_l.plot(t_days, rel_L, color="#4ecdc4", lw=1)
         ax_l.set_ylabel(ylabel, color="#ccc", fontsize=9)
-        ax_l.set_xlabel("Time (days)", color="#aaa", fontsize=8)
-        ax_l.set_title("Angular Momentum Drift", color="#ccc", fontsize=10)
+        ax_l.set_xlabel(f"Time ({time_unit})", color="#aaa", fontsize=8)
+        ax_l.set_title("Angular Momentum Change" if universe.force_method == "particle-mesh"
+                       else "Angular Momentum Drift", color="#ccc", fontsize=10)
         ax_l.tick_params(colors="#888", labelsize=7)
         ax_l.spines[:].set_color("#333")
         ax_l.axhline(0, color="#555", lw=0.5, ls="--")
@@ -208,14 +212,17 @@ def plot_results(universe, title: str = "N-Body Simulation", save_path: str | No
         ax_eb.plot(t_days, KE, color="#ffd93d", lw=0.8, label="KE")
         ax_eb.plot(t_days, PE, color="#6c5ce7", lw=0.8, label="PE")
         ax_eb.plot(t_days, E, color="#ff6b6b", lw=1.0, label="Total")
-        ax_eb.set_ylabel("Energy (J)", color="#ccc", fontsize=9)
-        ax_eb.set_xlabel("Time (days)", color="#aaa", fontsize=8)
+        ax_eb.set_ylabel("Energy (simulation units)", color="#ccc", fontsize=9)
+        ax_eb.set_xlabel(f"Time ({time_unit})", color="#aaa", fontsize=8)
         ax_eb.set_title("Energy Breakdown", color="#ccc", fontsize=10)
         ax_eb.tick_params(colors="#888", labelsize=7)
         ax_eb.spines[:].set_color("#333")
         ax_eb.legend(fontsize=7, facecolor="#222", edgecolor="#555", labelcolor="white", loc="best")
 
     fig.suptitle(title, color="white", fontsize=16, fontweight="bold", y=0.97)
+    if universe.force_method == "particle-mesh":
+        fig.text(0.5, 0.015, "Periodic mesh: energy includes grid self-energy; angular momentum is not a conserved periodic-box quantity.",
+                 ha="center", color="#aaa", fontsize=9)
 
     if save_path:
         fig.savefig(save_path, dpi=180, facecolor=fig.get_facecolor())
@@ -236,33 +243,134 @@ def print_conservation_summary(universe):
     max_dE = np.max(np.abs(E - E[0])) / abs(E0)
 
     L = np.array(universe.diag_L)
-    L_mag = np.linalg.norm(L, axis=1)
-    L0 = L_mag[0]
+    L_change = np.linalg.norm(L - L[0], axis=1)
+    L0 = np.linalg.norm(L[0])
     if L0 > 1e-12:
-        max_dL = np.max(np.abs(L_mag - L0)) / L0
+        max_dL = np.max(L_change) / L0
         L_label = f"max |ΔL / L₀|  = {max_dL:.4e}"
     else:
-        max_dL_abs = np.max(np.abs(L_mag - L0))
+        max_dL_abs = np.max(L_change)
         L_label = f"max |ΔL|       = {max_dL_abs:.4e}  (L₀ ≈ 0)"
 
     P = np.array(universe.diag_P)
-    P_mag = np.linalg.norm(P, axis=1)
-    P0 = P_mag[0]
+    P_change = np.linalg.norm(P - P[0], axis=1)
+    P0 = np.linalg.norm(P[0])
     if P0 > 1e-12:
-        max_dP = np.max(np.abs(P_mag - P0)) / P0
+        max_dP = np.max(P_change) / P0
         P_label = f"max |ΔP / P₀|  = {max_dP:.4e}"
     else:
-        max_dP_abs = np.max(np.abs(P_mag - P0))
+        max_dP_abs = np.max(P_change)
         P_label = f"max |ΔP|       = {max_dP_abs:.4e}  (P₀ ≈ 0)"
 
-    t_days = universe.diag_time[-1] / 86400
     print("=" * 60)
-    print(f"  Conservation Summary  ({t_days:.1f} days, "
-          f"{len(universe.diag_E)} steps)")
+    print(f"  Diagnostics  (t={universe.diag_time[-1]:.6g}, "
+          f"{universe.steps} steps, {len(universe.diag_E)} samples)")
     print("=" * 60)
+    print(f"  Model: {universe.energy_description}")
+    if universe.force_method == "particle-mesh":
+        print("  Angular momentum is not conserved in a periodic box.")
     print(f"  Energy:    max |ΔE / E₀|  = {max_dE:.4e}")
     print(f"  Ang. Mom:  {L_label}")
     print(f"  Lin. Mom:  {P_label}")
-    print(f"  E₀ = {E[0]:.6e} J")
-    print(f"  E_final = {E[-1]:.6e} J")
+    print(f"  E₀ = {E[0]:.6e}")
+    print(f"  E_final = {E[-1]:.6e}")
     print("=" * 60)
+
+
+def plot_force_comparison(runs, save_path=None):
+    """Plot diagnostic drift from already-computed isolated simulations."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5), facecolor="#0e0e12")
+    for ax in axes:
+        ax.set_facecolor("#14141a")
+        ax.tick_params(colors="#888")
+        ax.spines[:].set_color("#333")
+        ax.set_xlabel("Time (days)", color="#aaa")
+    for label, universe in runs:
+        times = np.array(universe.diag_time) / 86400
+        energy = np.array(universe.diag_E)
+        angular = np.array(universe.diag_L)
+        axes[0].plot(times, (energy-energy[0])/(abs(energy[0]) or 1), label=label)
+        axes[1].plot(times, np.linalg.norm(angular-angular[0], axis=1) /
+                     (np.linalg.norm(angular[0]) or 1), label=label)
+    for ax, title, ylabel in zip(axes, ("Energy Drift", "Angular Momentum Drift"),
+                                ("ΔE / |E₀|", "|ΔL| / |L₀|")):
+        ax.set_title(title, color="#ccc")
+        ax.set_ylabel(ylabel, color="#ccc")
+        ax.legend(fontsize=8, facecolor="#222", edgecolor="#555", labelcolor="white")
+    fig.suptitle("Isolated Force Solvers (same initial conditions)", color="white", fontsize=14)
+    fig.tight_layout()
+    if save_path:
+        fig.savefig(save_path, dpi=180, facecolor=fig.get_facecolor())
+        plt.close(fig)
+    else:
+        plt.show()
+
+
+def plot_validation_table(runs, save_path):
+    """Calculate table entries from recorded runs, including the initial state."""
+    rows = []
+    for label, integrator, universe in runs:
+        energy = np.array(universe.diag_E)
+        angular = np.array(universe.diag_L)
+        de = np.max(abs(energy-energy[0])) / (abs(energy[0]) or 1)
+        dl = np.max(np.linalg.norm(angular-angular[0], axis=1))
+        l0 = np.linalg.norm(angular[0])
+        angular_text = f"{dl/l0:.2e}" if l0 > 1e-12 else f"{dl:.2e} (absolute)"
+        rows.append([label, integrator, f"{de:.2e}", angular_text])
+    fig, ax = plt.subplots(figsize=(10, 3.8), facecolor="#0e0e12")
+    ax.axis("off")
+    table = ax.table(cellText=rows, colLabels=["Test Case", "Integrator", "max |ΔE/E₀|", "max |ΔL|/|L₀|"],
+                     cellLoc="center", loc="center")
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 1.8)
+    for (r, _), cell in table.get_celld().items():
+        cell.set_edgecolor("#444")
+        cell.set_facecolor("#1a1a2e" if r == 0 else "#14141a")
+        cell.set_text_props(color="#4ecdc4" if r == 0 else "#ddd")
+    fig.suptitle("Measured Orbit Validation — Direct Gravity", color="white", fontsize=14)
+    fig.text(0.5, 0.03, "Computed from these runs; near-zero initial angular momentum uses absolute change.",
+             ha="center", color="#aaa", fontsize=9)
+    fig.savefig(save_path, dpi=180, facecolor=fig.get_facecolor(), bbox_inches="tight")
+    plt.close(fig)
+
+
+def animate_trajectories(universe, save_path, *, stride=2, trail_length=300, fps=30):
+    """Save an XY animation of recorded histories; no simulation runs here."""
+    from matplotlib.animation import FuncAnimation, PillowWriter
+    import matplotlib.colors as mc
+    histories = [np.asarray(b.history_pos) for b in universe.bodies]
+    if not histories or not len(histories[0]):
+        raise ValueError("Animation requires recorded body histories")
+    fig, ax = plt.subplots(figsize=(7, 5.5), facecolor="#0e0e12")
+    ax.set_facecolor("#14141a")
+    ax.tick_params(colors="#aaa")
+    ax.spines[:].set_color("#333")
+    positions = np.concatenate(histories)
+    _equal_aspect(ax, positions[:, 0].tolist(), positions[:, 1].tolist())
+    ax.set_title("N-Body Trajectories", color="white")
+    trails, dots = [], []
+    for body in universe.bodies:
+        trail = LineCollection([], linewidths=2)
+        ax.add_collection(trail)
+        trails.append(trail)
+        dot, = ax.plot([], [], "o", color=body.color, ms=8, label=body.name)
+        dots.append(dot)
+    ax.legend(facecolor="#222", labelcolor="white")
+    label = ax.text(0.02, 0.02, "", transform=ax.transAxes, color="#aaa")
+
+    def update(frame):
+        for body, history, trail, dot in zip(universe.bodies, histories, trails, dots):
+            points = history[max(0, frame-trail_length):frame+1, :2]
+            segments = np.stack((points[:-1], points[1:]), axis=1)
+            trail.set_segments(segments)
+            rgb = mc.to_rgb(body.color)
+            trail.set_color([(*rgb, alpha) for alpha in np.linspace(0.05, 0.9, len(segments))])
+            dot.set_data([history[frame, 0]], [history[frame, 1]])
+        label.set_text(f"t = {universe.diag_time[frame]:.3f}")
+        return trails + dots + [label]
+
+    animation = FuncAnimation(fig, update, frames=range(0, len(histories[0]), stride),
+                              interval=1000/fps, blit=True)
+    animation.save(save_path, writer=PillowWriter(fps=fps), dpi=100)
+    plt.close(fig)
