@@ -1,199 +1,327 @@
 """
-Universe: simulation engine
- 
-Supports:
-  • Direct O(N²) pairwise gravity
-  • Barnes-Hut O(N log N) approximate gravity
-  • RK4 and symplectic leapfrog integrators
-  • Energy / momentum conservation tracking
+Universe: N-body simulation engine.
+
+Force selection, RK4 and leapfrog integration, and conservation diagnostics.
+The array-based JAX integrator is below the Universe class.
 """
- 
+
 import numpy as np
-from typing import Literal
-from core import Body, OctreeNode, build_octree
- 
- 
+from typing import NamedTuple, Any
+from core import (Body, MultipoleExpansion, ParticleMesh, _finite_scalar,
+                  _jax_modules, _concrete_array, make_state,
+                  differentiable_accelerations)
+
+
 class Universe:
- 
+    FORCE_METHODS = ("direct", "barnes-hut", "multipole", "particle-mesh")
+    INTEGRATORS = ("rk4", "leapfrog")
+
     def __init__(self, dt: float = 0.1, G: float = 6.6743e-11,
                  epsilon: float = 1e-3, theta: float = 0.5,
-                 force_method: Literal["direct", "barnes-hut"] = "direct"):
+                 force_method="direct", *, multipole_order=2, grid_size=64,
+                 box_size=None, box_origin=None, record_every=1):
         """
         Parameters
-        dt : float       Time-step (seconds).
-        G  : float       Gravitational constant.
-        epsilon : float  Softening length (same units as positions).
-        theta : float    Barnes-Hut opening angle (ignored for 'direct').
-        force_method :   'direct' for O(N²), 'barnes-hut' for O(N log N).
+        dt, G :          Positive timestep and gravitational constant.
+        epsilon :        Plummer softening length (unused by particle-mesh).
+        theta :          Tree opening angle; zero gives direct summation.
+        box_size :       Fixed periodic box side, or fit once if omitted.
+        record_every :   Save every N steps plus endpoints; 0 disables recording.
+
+        Isolated energy diagnostics cost O(N²), including for tree runs.
+        Particle-mesh uses a periodic grid energy diagnostic instead.
         """
         self.bodies: list[Body] = []
-        self.G = G
-        self.dt = dt
-        self.epsilon = epsilon
-        self.theta = theta
+        self.dt = _finite_scalar(dt, "dt", positive=True)
+        self.G = _finite_scalar(G, "G", positive=True)
+        self.epsilon = _finite_scalar(epsilon, "epsilon")
+        self.theta = _finite_scalar(theta, "theta")
+        MultipoleExpansion(self.theta, multipole_order)
+        self.multipole_order = multipole_order
+        self.particle_mesh = ParticleMesh(grid_size, box_size, origin=box_origin)
         self.force_method = force_method
+        if (isinstance(record_every, (bool, np.bool_))
+                or not isinstance(record_every, (int, np.integer))
+                or record_every < 0):
+            raise ValueError("record_every must be a non-negative integer")
+        self.record_every = int(record_every)
         self.time = 0.0
- 
-        # conservation diagnostics — populated every step
+        self.steps = 0
+
+        # conservation diagnostics
         self.diag_time: list[float] = []
         self.diag_KE: list[float] = []
         self.diag_PE: list[float] = []
         self.diag_E: list[float] = []
-        self.diag_L: list[np.ndarray] = []      # angular momentum vector
-        self.diag_P: list[np.ndarray] = []      # linear momentum vector
- 
+        self.diag_L: list[np.ndarray] = []
+        self.diag_P: list[np.ndarray] = []
+
+    @property
+    def force_method(self):
+        return self._force_method
+
+    @force_method.setter
+    def force_method(self, value):
+        if value not in self.FORCE_METHODS:
+            raise ValueError(f"Unknown force_method {value!r}; choose from {self.FORCE_METHODS}")
+        self._force_method = value
+
+    @property
+    def energy_description(self):
+        if self.force_method == "particle-mesh":
+            return "periodic mesh energy (includes mesh self-energy; grid diagnostic)"
+        return "isolated Plummer pair energy (exact diagnostic; approximate tree forces)"
+
     # body management
     def add_body(self, body: Body):
+        if not isinstance(body, Body):
+            raise TypeError("add_body expects a Body")
+        if any(existing is body for existing in self.bodies):
+            raise ValueError("The same Body cannot be added twice")
         self.bodies.append(body)
- 
+
+    def differentiable_state(self):
+        """Snapshot current Body values into an independent JAX ParticleState."""
+        return make_state([b.mass for b in self.bodies],
+                          [b.position for b in self.bodies],
+                          [b.velocity for b in self.bodies])
+
+    def simulate_differentiable(self, steps, method="leapfrog", *, state=None):
+        """Simulate direct gravity without changing the Universe or its histories.
+
+        Pass state when differentiating masses or initial conditions. Keep
+        driver settings fixed when using this method inside jax.jit.
+        """
+        if self.force_method != "direct":
+            raise ValueError("Differentiable simulation currently requires force_method='direct'")
+        if state is None:
+            state = self.differentiable_state()
+        return simulate(state, dt=self.dt, steps=steps, method=method, G=self.G,
+                        epsilon=self.epsilon, t0=self.time)
+
     # force computation
     def _compute_accelerations_direct(self):
-        """O(N²) pairwise Newtonian gravity."""
-        for b in self.bodies:
-            b.acceleration[:] = 0.0
- 
-        n = len(self.bodies)
-        for i in range(n):
-            for j in range(i + 1, n):
-                b1, b2 = self.bodies[i], self.bodies[j]
-                r_vec = b2.position - b1.position
-                dist = np.linalg.norm(r_vec)
-                soft = dist + self.epsilon
-                force_over_soft = self.G * b1.mass * b2.mass / (soft * soft * soft)
-                # Newton III: equal and opposite
-                acc_ij = force_over_soft * r_vec
-                b1.acceleration += acc_ij / b1.mass
-                b2.acceleration -= acc_ij / b2.mass
- 
+        """Pairwise Plummer gravity with equal-and-opposite pair forces."""
+        for body in self.bodies:
+            body.acceleration[:] = 0
+        for i, first in enumerate(self.bodies):
+            for second in self.bodies[i + 1:]:
+                delta = second.position - first.position
+                d2 = delta @ delta + self.epsilon**2
+                if d2 == 0:
+                    raise ValueError("Coincident particles require epsilon > 0")
+                kernel = self.G * delta / d2**1.5
+                first.acceleration += second.mass * kernel
+                second.acceleration -= first.mass * kernel
+
     def _compute_accelerations_barneshut(self):
-        """Barnes-Hut O(N log N) approximate gravity."""
-        tree = build_octree(self.bodies)
-        for b in self.bodies:
-            b.acceleration = tree.compute_acceleration(
-                b, self.theta, self.G, self.epsilon
-            )
- 
+        MultipoleExpansion(self.theta, order=0).compute_accelerations(
+            self.bodies, self.G, self.epsilon)
+
     def compute_accelerations(self):
-        if self.force_method == "barnes-hut":
-            self._compute_accelerations_barneshut()
-        else:
+        if self.force_method == "direct":
             self._compute_accelerations_direct()
- 
+        elif self.force_method == "barnes-hut":
+            self._compute_accelerations_barneshut()
+        elif self.force_method == "multipole":
+            MultipoleExpansion(self.theta, self.multipole_order).compute_accelerations(
+                self.bodies, self.G, self.epsilon)
+        else:
+            self.particle_mesh.compute_accelerations(self.bodies, self.G, self.epsilon)
+
+    def _start_step(self):
+        if self.record_every and not self.diag_time:
+            self._record()
+
+    def _finish_step(self):
+        self.time += self.dt
+        self.steps += 1
+        if self.record_every and self.steps % self.record_every == 0:
+            self._record()
+
     # integrators
     def step_rk4(self):
-        """Classical 4th-order Runge-Kutta."""
+        """Classical fixed-step RK4; four stages plus final acceleration refresh."""
+        self._start_step()
         dt = self.dt
-        n = len(self.bodies)
- 
-        # cache initial state
-        r0 = [b.position.copy() for b in self.bodies]
-        v0 = [b.velocity.copy() for b in self.bodies]
- 
+        r0 = np.array([b.position for b in self.bodies]).reshape(-1, 3)
+        v0 = np.array([b.velocity for b in self.bodies]).reshape(-1, 3)
+
+        def acceleration_at(positions):
+            for body, pos in zip(self.bodies, positions):
+                body.position[:] = pos
+            self.compute_accelerations()
+            return np.array([b.acceleration for b in self.bodies]).reshape(-1, 3)
+
         # k1
-        self.compute_accelerations()
-        k1r = [b.velocity.copy() for b in self.bodies]
-        k1v = [b.acceleration.copy() for b in self.bodies]
- 
-        # k2 — evaluate at midpoint using k1
-        for i in range(n):
-            self.bodies[i].position = r0[i] + 0.5 * dt * k1r[i]
-            self.bodies[i].velocity = v0[i] + 0.5 * dt * k1v[i]
-        self.compute_accelerations()
-        k2r = [b.velocity.copy() for b in self.bodies]
-        k2v = [b.acceleration.copy() for b in self.bodies]
- 
-        # k3 — evaluate at midpoint using k2
-        for i in range(n):
-            self.bodies[i].position = r0[i] + 0.5 * dt * k2r[i]
-            self.bodies[i].velocity = v0[i] + 0.5 * dt * k2v[i]
-        self.compute_accelerations()
-        k3r = [b.velocity.copy() for b in self.bodies]
-        k3v = [b.acceleration.copy() for b in self.bodies]
- 
-        # k4 — evaluate at end using k3
-        for i in range(n):
-            self.bodies[i].position = r0[i] + dt * k3r[i]
-            self.bodies[i].velocity = v0[i] + dt * k3v[i]
-        self.compute_accelerations()
-        k4r = [b.velocity.copy() for b in self.bodies]
-        k4v = [b.acceleration.copy() for b in self.bodies]
- 
+        k1r = v0
+        k1v = acceleration_at(r0)
+
+        # k2, k3: midpoint estimates
+        k2r = v0 + 0.5 * dt * k1v
+        k2v = acceleration_at(r0 + 0.5 * dt * k1r)
+        k3r = v0 + 0.5 * dt * k2v
+        k3v = acceleration_at(r0 + 0.5 * dt * k2r)
+
+        # k4: full step
+        k4r = v0 + dt * k3v
+        k4v = acceleration_at(r0 + dt * k3r)
+
         # weighted combination
-        for i in range(n):
-            b = self.bodies[i]
-            b.position = r0[i] + (dt / 6.0) * (k1r[i] + 2*k2r[i] + 2*k3r[i] + k4r[i])
-            b.velocity = v0[i] + (dt / 6.0) * (k1v[i] + 2*k2v[i] + 2*k3v[i] + k4v[i])
- 
-        self.time += dt
-        self._record()
- 
+        positions = r0 + dt / 6 * (k1r + 2*k2r + 2*k3r + k4r)
+        velocities = v0 + dt / 6 * (k1v + 2*k2v + 2*k3v + k4v)
+        for body, pos, vel in zip(self.bodies, positions, velocities):
+            body.position[:] = pos
+            body.velocity[:] = vel
+        self.compute_accelerations()
+        self._finish_step()
+
     def step_leapfrog(self):
-        """Symplectic Kick-Drift-Kick leapfrog."""
-        dt = self.dt
- 
-        # kick (half)
+        """Second-order kick-drift-kick; symplectic for conservative forces.
+
+        One-sided tree approximations and the PM grid force do not guarantee
+        the same Hamiltonian conservation properties as exact pair gravity.
+        """
+        self._start_step()
+
+        # kick (half), then drift (full)
         self.compute_accelerations()
-        for b in self.bodies:
-            b.velocity += 0.5 * dt * b.acceleration
- 
-        # drift (full)
-        for b in self.bodies:
-            b.position += dt * b.velocity
- 
-        # kick (half)
+        for body in self.bodies:
+            body.velocity += 0.5 * self.dt * body.acceleration
+            body.position += self.dt * body.velocity
+
+        # kick (half) at the new positions
         self.compute_accelerations()
-        for b in self.bodies:
-            b.velocity += 0.5 * dt * b.acceleration
- 
-        self.time += dt
-        self._record()
- 
+        for body in self.bodies:
+            body.velocity += 0.5 * self.dt * body.acceleration
+        self._finish_step()
+
     # conservation diagnostics
     def kinetic_energy(self) -> float:
-        return sum(0.5 * b.mass * np.dot(b.velocity, b.velocity) for b in self.bodies)
- 
+        return float(sum(0.5 * b.mass * (b.velocity @ b.velocity) for b in self.bodies))
+
     def potential_energy(self) -> float:
-        pe = 0.0
-        n = len(self.bodies)
-        for i in range(n):
-            for j in range(i + 1, n):
-                r = np.linalg.norm(self.bodies[j].position - self.bodies[i].position)
-                pe -= self.G * self.bodies[i].mass * self.bodies[j].mass / (r + self.epsilon)
-        return pe
- 
+        if self.force_method == "particle-mesh":
+            return self.particle_mesh.potential_energy(self.bodies, self.G)
+        energy = 0.0
+        for i, first in enumerate(self.bodies):
+            for second in self.bodies[i + 1:]:
+                delta = second.position - first.position
+                distance = np.sqrt(delta @ delta + self.epsilon**2)
+                if distance == 0:
+                    raise ValueError("Coincident particles require epsilon > 0")
+                energy -= self.G * first.mass * second.mass / distance
+        return float(energy)
+
     def total_energy(self) -> float:
         return self.kinetic_energy() + self.potential_energy()
- 
+
     def linear_momentum(self) -> np.ndarray:
-        return sum(b.mass * b.velocity for b in self.bodies)
- 
+        return sum((b.mass * b.velocity for b in self.bodies), np.zeros(3))
+
     def angular_momentum(self) -> np.ndarray:
-        return sum(b.mass * np.cross(b.position, b.velocity) for b in self.bodies)
- 
+        return sum((b.mass * np.cross(b.position, b.velocity) for b in self.bodies), np.zeros(3))
+
     def _record(self):
-        """Snapshot positions/velocities and conservation quantities."""
-        for b in self.bodies:
-            b.snapshot()
         ke = self.kinetic_energy()
         pe = self.potential_energy()
+        for body in self.bodies:
+            body.snapshot()
         self.diag_time.append(self.time)
         self.diag_KE.append(ke)
         self.diag_PE.append(pe)
         self.diag_E.append(ke + pe)
         self.diag_L.append(self.angular_momentum().copy())
         self.diag_P.append(self.linear_momentum().copy())
- 
+
     # run helper
-    def run(self, steps: int,
-            method: Literal["rk4", "leapfrog"] = "leapfrog",
-            progress: bool = True):
-        """
-        Advance the simulation by *steps* time-steps.
-        """
+    def run(self, steps: int, method: str = "leapfrog", progress: bool = True):
+        """Advance the simulation by the requested number of timesteps."""
+        if method not in self.INTEGRATORS:
+            raise ValueError(f"Unknown integrator {method!r}; choose from {self.INTEGRATORS}")
+        if (isinstance(steps, (bool, np.bool_))
+                or not isinstance(steps, (int, np.integer))
+                or steps < 0):
+            raise ValueError("steps must be a non-negative integer")
         stepper = self.step_rk4 if method == "rk4" else self.step_leapfrog
         for i in range(steps):
             stepper()
             if progress and (i + 1) % max(1, steps // 10) == 0:
                 pct = 100 * (i + 1) / steps
-                print(f"  [{pct:5.1f}%]  t = {self.time:.3e} s  "
-                      f"E = {self.diag_E[-1]:.6e} J")
+                print(f"  [{pct:5.1f}%]  t = {self.time:.6e}")
+        if steps and self.record_every and self.diag_time[-1] != self.time:
+            self._record()
+
+
+# Differentiable integration
+
+class Trajectory(NamedTuple):
+    """JAX arrays: times (steps+1,), positions/velocities (steps+1, N, 3)."""
+
+    times: Any
+    positions: Any
+    velocities: Any
+
+
+def simulate(state, *, dt, steps, method="leapfrog", G=1.0, epsilon=0.0, t0=0.0):
+    """Integrate JAX particle arrays with direct gravity, RK4 or leapfrog.
+
+    Returns the initial state and every following step. Keyword arguments are
+    fixed settings; derivatives are taken with respect to the input state.
+    """
+    if method not in Universe.INTEGRATORS:
+        raise ValueError(f"Unknown integrator {method!r}")
+    if (isinstance(steps, (bool, np.bool_))
+            or not isinstance(steps, (int, np.integer))
+            or steps < 0):
+        raise ValueError("steps must be a non-negative integer")
+    dt = _finite_scalar(dt, "dt", positive=True)
+    G = _finite_scalar(G, "G", positive=True)
+    epsilon = _finite_scalar(epsilon, "epsilon")
+    t0 = float(t0)
+    if not np.isfinite(t0) or not np.isfinite(t0 + steps * dt):
+        raise ValueError("trajectory times must be finite")
+    jax, jnp = _jax_modules()
+    state = make_state(*state)
+    positions = _concrete_array(state.positions)
+    if epsilon == 0 and positions is not None:
+        if len(np.unique(positions, axis=0)) != len(positions):
+            raise ValueError("Coincident particles require epsilon > 0")
+
+    def acceleration(r):
+        return differentiable_accelerations(state.masses, r, G, epsilon)
+
+    def step(carry, unused):
+        r, v = carry
+        if method == "leapfrog":
+            # kick (half), drift (full), kick (half)
+            half_v = v + 0.5 * dt * acceleration(r)
+            r_next = r + dt * half_v
+            v_next = half_v + 0.5 * dt * acceleration(r_next)
+        else:
+            # k1
+            k1r = v
+            k1v = acceleration(r)
+
+            # k2, k3: midpoint estimates
+            k2r = v + 0.5 * dt * k1v
+            k2v = acceleration(r + 0.5 * dt * k1r)
+            k3r = v + 0.5 * dt * k2v
+            k3v = acceleration(r + 0.5 * dt * k2r)
+
+            # k4: full step
+            k4r = v + dt * k3v
+            k4v = acceleration(r + dt * k3r)
+
+            # weighted combination
+            r_next = r + dt / 6 * (k1r + 2*k2r + 2*k3r + k4r)
+            v_next = v + dt / 6 * (k1v + 2*k2v + 2*k3v + k4v)
+        return (r_next, v_next), (r_next, v_next)
+
+    # scan keeps the time loop compact when JAX compiles it.
+    initial = (state.positions, state.velocities)
+    _, (r, v) = jax.lax.scan(step, initial, None, length=int(steps))
+    times = t0 + dt * jnp.arange(steps + 1, dtype=jnp.float64)
+    positions = jnp.concatenate((state.positions[None], r))
+    velocities = jnp.concatenate((state.velocities[None], v))
+    return Trajectory(times, positions, velocities)
