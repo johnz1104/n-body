@@ -335,42 +335,60 @@ def plot_validation_table(runs, save_path):
     plt.close(fig)
 
 
-def animate_trajectories(universe, save_path, *, stride=2, trail_length=300, fps=30):
-    """Save an XY animation of recorded histories; no simulation runs here."""
+def animate_trajectories(universe, save_path, *, stride=2, trail_length=300, fps=30,
+                         title="N-Body Trajectories", body_indices=None,
+                         length_scale=1.0, length_unit="simulation units",
+                         time_scale=1.0, time_unit="simulation units"):
+    """Save an XY animation of recorded histories; no simulation runs here.
+
+    body_indices selects which bodies to display without changing the simulation.
+    Recorded lengths and times are divided by the supplied display scales.
+    """
     from matplotlib.animation import FuncAnimation, PillowWriter
     import matplotlib.colors as mc
-    histories = [np.asarray(b.history_pos) for b in universe.bodies]
+    bodies = (universe.bodies if body_indices is None else
+              [universe.bodies[i] for i in body_indices])
+    histories = [np.asarray(b.history_pos) / length_scale for b in bodies]
     if not histories or not len(histories[0]):
         raise ValueError("Animation requires recorded body histories")
-    fig, ax = plt.subplots(figsize=(7, 5.5), facecolor="#0e0e12")
+    fig, ax = plt.subplots(figsize=(7, 5.5), facecolor="#0e0e12",
+                           layout="constrained")
     ax.set_facecolor("#14141a")
     ax.tick_params(colors="#aaa")
     ax.spines[:].set_color("#333")
     positions = np.concatenate(histories)
     _equal_aspect(ax, positions[:, 0].tolist(), positions[:, 1].tolist())
-    ax.set_title("N-Body Trajectories", color="white")
+    ax.set_title(title, color="white", fontsize=13)
+    ax.set_xlabel(f"X ({length_unit})", color="#aaa")
+    ax.set_ylabel(f"Y ({length_unit})", color="#aaa")
     trails, dots = [], []
-    for body in universe.bodies:
-        trail = LineCollection([], linewidths=2)
+    for body in bodies:
+        trail = LineCollection([], linewidths=2 if len(bodies) <= 10 else 0.8)
         ax.add_collection(trail)
         trails.append(trail)
-        dot, = ax.plot([], [], "o", color=body.color, ms=8, label=body.name)
+        dot, = ax.plot([], [], "o", color=body.color,
+                       ms=8 if len(bodies) <= 10 else 4, label=body.name)
         dots.append(dot)
-    ax.legend(facecolor="#222", labelcolor="white")
+    if len(bodies) <= 10:
+        ax.legend(facecolor="#222", edgecolor="#444", labelcolor="white",
+                  loc="upper right", fontsize=8)
     label = ax.text(0.02, 0.02, "", transform=ax.transAxes, color="#aaa")
 
     def update(frame):
-        for body, history, trail, dot in zip(universe.bodies, histories, trails, dots):
+        for body, history, trail, dot in zip(bodies, histories, trails, dots):
             points = history[max(0, frame-trail_length):frame+1, :2]
             segments = np.stack((points[:-1], points[1:]), axis=1)
             trail.set_segments(segments)
             rgb = mc.to_rgb(body.color)
             trail.set_color([(*rgb, alpha) for alpha in np.linspace(0.05, 0.9, len(segments))])
             dot.set_data([history[frame, 0]], [history[frame, 1]])
-        label.set_text(f"t = {universe.diag_time[frame]:.3f}")
+        label.set_text(f"t = {universe.diag_time[frame] / time_scale:.2f} {time_unit}")
         return trails + dots + [label]
 
-    animation = FuncAnimation(fig, update, frames=range(0, len(histories[0]), stride),
+    frames = list(range(0, len(histories[0]), stride))
+    if frames[-1] != len(histories[0]) - 1:
+        frames.append(len(histories[0]) - 1)
+    animation = FuncAnimation(fig, update, frames=frames,
                               interval=1000/fps, blit=True)
     animation.save(save_path, writer=PillowWriter(fps=fps), dpi=100)
     plt.close(fig)

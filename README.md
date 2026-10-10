@@ -11,7 +11,7 @@ astronomical observations.
 </p>
 
 *Figure-eight choreography from the original implementation. See the
-[historical gallery](#historical-gallery) for more simulation visuals.*
+[animated gallery](#animated-gallery) for simulations using the current solver.*
 
 `core.py` owns particles and gravity primitives. `universe.py` drives the
 simulation, integration, and diagnostics. `visualization.py` consumes recorded
@@ -344,28 +344,44 @@ recovery from noisy observations generated at finer resolution. With JAX absent,
 the differentiable test module skips; `requirements-dev.txt` installs it so the
 full suite runs.
 
-The existing images and GIF under `results/` are **historical showcase assets**
-from the earlier implementation. Their embedded numbers are not current
-validation evidence. `generate_results.py` now computes validation table entries
-from actual runs rather than hard-coded values. It delegates every plot and
-animation to `visualization.py`. Its legacy `fmm_solar.png` filename is retained
+The original PNGs and `figure_eight.gif` directly under `results/` are
+**historical showcase assets** from the earlier implementation. Their embedded
+numbers are not current validation evidence. `generate_results.py` now computes
+validation table entries from actual runs rather than hard-coded values. It
+delegates every plot and animation to `visualization.py`. Its legacy
+`fmm_solar.png` filename is retained
 for compatibility but the solver is the quadrupole tree described above.
 
-### Historical gallery
+### Animated gallery
 
-These plots show trajectories, spatial projections, and conservation diagnostics
-from the earlier implementation. Embedded error values describe those historical
-runs; use the validation commands above to evaluate the current solver. Click a
-preview to view the full-resolution image.
+These GIFs are generated with the current solver. Each shows the XY projection
+with fading trails and elapsed simulation time. Solar previews focus on the Sun
+and four inner planets from a full eight-planet simulation over two years. The
+clusters use 64 bodies with a fixed random seed; particle-mesh gravity uses a
+periodic box, with trajectories displayed unwrapped.
 
-| Solar system: direct gravity + leapfrog | 64-body cluster: Barnes–Hut |
+| Inner solar system: direct + leapfrog | 64-body cluster: Barnes–Hut + leapfrog |
 |---|---|
-| [![Historical solar-system trajectories and conservation diagnostics](results/solar_system.png)](results/solar_system.png) | [![Historical 64-body cluster trajectories and conservation diagnostics](results/random_cluster.png)](results/random_cluster.png) |
+| [![Animated inner solar-system orbits with direct gravity](results/animations/solar_system.gif)](results/animations/solar_system.gif) | [![Animated 64-body cluster with Barnes–Hut gravity](results/animations/random_cluster.gif)](results/animations/random_cluster.gif) |
+| **Inner solar system: quadrupole tree + leapfrog** | **64-body cluster: particle-mesh + leapfrog** |
+| [![Animated inner solar-system orbits with quadrupole-tree gravity](results/animations/multipole_solar.gif)](results/animations/multipole_solar.gif) | [![Animated 64-body cluster with periodic particle-mesh gravity](results/animations/pm_cluster.gif)](results/animations/pm_cluster.gif) |
 
-More historical plots: [figure-eight diagnostics](results/figure_eight.png),
+Regenerate just these four animations without replacing the original assets:
+
+```bash
+python generate_results.py --animations-only
+# Or keep a separate run:
+python generate_results.py --animations-only --output-dir /tmp/nbody-results
+```
+
+Static diagnostic plots from the earlier implementation remain available:
+[solar system](results/solar_system.png), [Barnes–Hut cluster](results/random_cluster.png),
+[figure-eight diagnostics](results/figure_eight.png),
 [quadrupole-tree solar system](results/fmm_solar.png),
 [particle-mesh cluster](results/pm_cluster.png), and
-[force-method comparison](results/force_comparison.png).
+[force-method comparison](results/force_comparison.png). Their embedded error
+values describe historical runs; use the validation commands above to evaluate
+the current solver.
 
 ## Project layout
 
@@ -381,7 +397,8 @@ stub.py                 Compatibility imports and attach(), no solver duplicatio
 tests/test_solver.py    Numerical and API regressions
 tests/test_differentiable.py  Derivative and inference regressions
 requirements*.txt       Runtime and development dependencies
-results/                Historical gallery
+results/                Historical plots and figure-eight animation
+results/animations/     Current-solver animated gallery
 ```
 
 Existing `from stub import FastMultipole, ParticleMesh, attach` usage still

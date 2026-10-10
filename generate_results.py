@@ -1,7 +1,8 @@
 """Run example simulations and delegate all rendering to visualization.py.
 
-Existing results/ images are historical; regenerating intentionally replaces them.
+Original assets directly in results/ are historical; full regeneration replaces them.
 Use --output-dir to keep a new run separate.
+Use --animations-only to generate the README GIFs in an animations/ subdirectory.
 """
 
 from pathlib import Path
@@ -75,17 +76,48 @@ def gen_figure_eight_gif():
     animate_trajectories(u, OUT / "figure_eight.gif")
 
 
+def gen_gallery_animations():
+    """Current-solver previews, kept separate from the historical gallery."""
+    from visualization import animate_trajectories
+    directory = OUT / "animations"
+    directory.mkdir(parents=True, exist_ok=True)
+    display = dict(fps=25, time_scale=86400.0, time_unit="days")
+    for force, filename in (("direct", "solar_system.gif"),
+                            ("multipole", "multipole_solar.gif")):
+        u = solar_system(force_method=force, theta=0.3, plot=False, progress=False)
+        animate_trajectories(
+            u, directory / filename, stride=4, trail_length=180,
+            title=f"Inner solar system · {force} + leapfrog",
+            body_indices=range(5), length_scale=149597870700.0, length_unit="AU",
+            **display)
+        print(f"Saved → {directory / filename}", flush=True)
+    for force, filename, options in (
+            ("barnes-hut", "random_cluster.gif", dict(steps=500)),
+            ("particle-mesh", "pm_cluster.gif",
+             dict(steps=300, grid_size=32, box_size=6e10))):
+        u = random_cluster(force_method=force, plot=False, progress=False, **options)
+        animate_trajectories(
+            u, directory / filename, stride=2, trail_length=80,
+            title=f"64-body cluster · {force} + leapfrog",
+            length_scale=1e9, length_unit="10⁹ m", **display)
+        print(f"Saved → {directory / filename}", flush=True)
+
+
 if __name__ == "__main__":
     import argparse
     import matplotlib
     matplotlib.use("Agg")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=OUT)
+    parser.add_argument("--animations-only", action="store_true",
+                        help="Generate only the four README trajectory GIFs in animations/")
     args = parser.parse_args()
     OUT = args.output_dir
     OUT.mkdir(parents=True, exist_ok=True)
-    for generate in (gen_solar_system, gen_figure_eight, gen_random_cluster,
-                     gen_force_comparison, gen_fmm_solar, gen_pm_cluster,
-                     gen_validation_table, gen_figure_eight_gif):
+    generators = ((gen_gallery_animations,) if args.animations_only else
+                  (gen_solar_system, gen_figure_eight, gen_random_cluster,
+                   gen_force_comparison, gen_fmm_solar, gen_pm_cluster,
+                   gen_validation_table, gen_figure_eight_gif, gen_gallery_animations))
+    for generate in generators:
         generate()
-    print(f"All eight assets written to {OUT}")
+    print(f"Assets written to {OUT}")
