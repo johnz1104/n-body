@@ -6,6 +6,13 @@ forces, and periodic particle-mesh gravity. Its JAX path computes derivatives
 through direct-gravity simulations to fit masses and initial conditions to
 astronomical observations.
 
+<p align="center">
+  <img src="results/figure_eight.gif" alt="Three equal-mass bodies following a figure-eight orbit" width="580" />
+</p>
+
+*Figure-eight choreography from the original implementation. See the
+[historical gallery](#historical-gallery) for more simulation visuals.*
+
 `core.py` owns particles and gravity primitives. `universe.py` drives the
 simulation, integration, and diagnostics. `visualization.py` consumes recorded
 results without running the physics. Differentiable RK4 and leapfrog currently
@@ -343,6 +350,22 @@ validation evidence. `generate_results.py` now computes validation table entries
 from actual runs rather than hard-coded values. It delegates every plot and
 animation to `visualization.py`. Its legacy `fmm_solar.png` filename is retained
 for compatibility but the solver is the quadrupole tree described above.
+
+### Historical gallery
+
+These plots show trajectories, spatial projections, and conservation diagnostics
+from the earlier implementation. Embedded error values describe those historical
+runs; use the validation commands above to evaluate the current solver. Click a
+preview to view the full-resolution image.
+
+| Solar system: direct gravity + leapfrog | 64-body cluster: Barnes–Hut |
+|---|---|
+| [![Historical solar-system trajectories and conservation diagnostics](results/solar_system.png)](results/solar_system.png) | [![Historical 64-body cluster trajectories and conservation diagnostics](results/random_cluster.png)](results/random_cluster.png) |
+
+More historical plots: [figure-eight diagnostics](results/figure_eight.png),
+[quadrupole-tree solar system](results/fmm_solar.png),
+[particle-mesh cluster](results/pm_cluster.png), and
+[force-method comparison](results/force_comparison.png).
 
 ## Project layout
 
